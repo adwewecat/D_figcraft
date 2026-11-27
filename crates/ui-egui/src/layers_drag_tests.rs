@@ -1,0 +1,314 @@
+//! Dragging rows in the layers panel, driven through egui headless: holding over a collapsed
+//! frame opens it, a layer can't be dropped into itself, Escape cancels, and the list scrolls at
+//! its edges.
+
+use egui::{Event, Pos2, RawInput, Rect, vec2};
+use figcraft_doc::NodeId;
+use figcraft_engine::Session;
+use serde_json::json;
+
+use crate::{FigApp, NoServices};
+
+pub(crate) struct Ui {
+    pub(crate) ctx: egui::Context,
+    pub(crate) app: FigApp,
+    time: f64,
+    /// The test screen's size (1440 x 900 unless a test shrinks it).
+    pub(crate) screen: egui::Vec2,
+}
+
+impl Ui {
+    pub(crate) fn new(s: Session) -> Self {
+        let mut u =
+            Self { ctx: crate::framework::headless_context(), app: FigApp::new(s, Box::new(NoServices)), time: 0.0, screen: vec2(1440.0, 900.0) };
+        for _ in 0..3 {
+            u.frame(vec![]);
+        }
+        u
+    }
+
+    pub(crate) fn frame(&mut self, events: Vec<Event>) {
+        self.frame_output(events);
+    }
+
+    /// [`Self::frame`], returning what egui output (the AccessKit tree when it's enabled).
+    pub(crate) fn frame_output(&mut self, events: Vec<Event>) -> egui::FullOutput {
+        self.frame_with(events, Default::default())
+    }
+
+    /// [`Self::frame_output`] with `modifiers` held.
+    pub(crate) fn frame_with(&mut self, mut events: Vec<Event>, modifiers: egui::Modifiers) -> egui::FullOutput {
+        events.insert(0, Event::ModifiersChanged(modifiers));
+        self.frame_raw(RawInput { events, ..Default::default() })
+    }
+
+    /// One frame of `raw` input (files dropped on or hovered over the window, say), on the test
+    /// screen and clock.
+    pub(crate) fn frame_raw(&mut self, raw: RawInput) -> egui::FullOutput {
+        self.time += 1.0 / 60.0;
+        self.app.clock.set_test_now(Some(self.time));
+        let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.screen)), time: Some(self.time), ..raw };
+        let app = &mut self.app;
+        // As the shells do: the runtime gets FigCraft's frame input before the frame.
+        app.before_input(&self.ctx);
+        let mut out = self.ctx.run_ui(input, |ui| app.ui(ui));
+        out.textures_delta.clear();
+        out
+    }
+
+    /// One frame that egui reruns as a discarded pass (the returned output is the presented pass).
+    ///
+    /// The rerun sees the same `RawInput`; the custom text editor must not apply its events twice,
+    /// and the IME descriptor of the presented pass must still describe the first pass's result.
+    pub(crate) fn frame_raw_with_discard(&mut self, raw: RawInput) -> egui::FullOutput {
+        self.time += 1.0 / 60.0;
+        self.app.clock.set_test_now(Some(self.time));
+        let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0))), time: Some(self.time), ..raw };
+        let Ui { ctx, app, .. } = self;
+        app.before_input(ctx);
+        let mut out = ctx.run_ui(input, |ui| {
+            app.ui(ui);
+            if ui.ctx().current_pass_index() == 0 {
+                ui.ctx().request_discard("ime test: exercise a discarded pass");
+            }
+        });
+        out.textures_delta.clear();
+        out
+    }
+
+    /// Move the harness time (and the app's monotonic clock) forward, e.g. past a deadline; the
+    /// next frame continues from here.
+    pub(crate) fn advance_clock(&mut self, secs: f64) {
+        self.time = secs;
+        self.app.clock.set_test_now(Some(secs));
+    }
+
+    /// The middle of `id`'s row in the layers panel (found by hovering down the panel).
+    pub(crate) fn row_at(&mut self, id: NodeId) -> Pos2 {
+        let mut hits = Vec::new();
+        for y in (60..900).step_by(2) {
+            let p = Pos2::new(150.0, y as f32);
+            // The panel only sets the hover when a row is under the pointer.
+            self.app.session.ds_mut().unwrap().hover = None;
+            self.frame(vec![Event::PointerMoved(p)]);
+            if self.app.session.ds().unwrap().hover == Some(id) {
+                hits.push(p.y);
+            } else if !hits.is_empty() {
+                break;
+            }
+        }
+        assert!(!hits.is_empty(), "no row for {id:?}");
+        Pos2::new(150.0, (hits[0] + hits[hits.len() - 1]) / 2.0)
+    }
+
+    pub(crate) fn button(&mut self, p: Pos2, pressed: bool) {
+        self.frame(vec![
+            Event::PointerMoved(p),
+            Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() },
+        ]);
+    }
+
+    /// Press on `from` and move to `to` in small steps (a drag, not yet released).
+    pub(crate) fn drag_to(&mut self, from: Pos2, to: Pos2) {
+        self.button(from, true);
+        for k in 1..=10 {
+            self.frame(vec![Event::PointerMoved(from + (to - from) * (k as f32 / 10.0))]);
+        }
+    }
+}
+
+fn id(v: serde_json::Value) -> NodeId {
+    NodeId(v["id"].as_u64().unwrap())
+}
+
+/// A frame with one child (collapsed in the panel) and a rectangle beside it.
+fn setup() -> (Ui, NodeId, NodeId, NodeId) {
+    let mut s = Session::new();
+    let frame = id(s.execute("node.create", &json!({"type": "frame", "x": 0, "y": 0, "width": 100, "height": 100})).unwrap());
+    let child = id(s.execute("node.create", &json!({"type": "ellipse", "parent": frame, "x": 10, "y": 10, "width": 10, "height": 10})).unwrap());
+    let rect = id(s.execute("node.create", &json!({"type": "rectangle", "x": 200, "y": 0, "width": 10, "height": 10})).unwrap());
+    s.execute("select.none", &json!({})).unwrap();
+    let mut u = Ui::new(s);
+    u.app.ui.expanded.clear();
+    u.frame(vec![]);
+    (u, frame, child, rect)
+}
+
+#[test]
+fn vertical_auto_layout_layers_follow_the_canvas_before_and_after_a_drop() {
+    let mut s = Session::new();
+    let frame = id(s.execute("node.create", &json!({"type": "frame", "width": 180, "height": 160, "props": {"layout": "vertical"}})).unwrap());
+    let rect = |s: &mut Session, name: &str| {
+        id(s.execute("node.create", &json!({"type": "rectangle", "parent": frame, "width": 80, "height": 30, "name": name})).unwrap())
+    };
+    let first = rect(&mut s, "First");
+    let second = rect(&mut s, "Second");
+    s.execute("select.none", &json!({})).unwrap();
+    let mut u = Ui::new(s);
+    u.app.ui.expanded.insert(frame);
+    let canvas_top = |u: &Ui, id: NodeId| u.app.session.doc().unwrap().world_bounds(id).unwrap().y0;
+    assert!(canvas_top(&u, first) < canvas_top(&u, second));
+    let (top, bottom) = (u.row_at(first), u.row_at(second));
+    assert!(top.y < bottom.y, "the Layers panel follows the vertical flow");
+
+    let above_first = top - vec2(0.0, 4.0);
+    u.drag_to(bottom, above_first);
+    u.button(above_first, false);
+    assert!(canvas_top(&u, second) < canvas_top(&u, first), "dropping above moves it up on the canvas");
+    assert!(u.row_at(second).y < u.row_at(first).y, "the Layers order follows the drop");
+
+    u.app.run("select.set", json!({"ids": [second]}));
+    u.ctx.enable_accesskit();
+    u.frame(vec![]);
+    let press = |u: &mut Ui, key| {
+        u.frame(
+            [true, false]
+                .into_iter()
+                .map(|pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() })
+                .collect(),
+        );
+    };
+    for _ in 0..4 {
+        press(&mut u, egui::Key::F6);
+        if u.app.ui.nav.region == crate::a11y::Region::Layers {
+            break;
+        }
+    }
+    assert_eq!(u.app.ui.nav.region, crate::a11y::Region::Layers);
+    press(&mut u, egui::Key::ArrowDown);
+    u.frame(vec![]);
+    assert_eq!(u.app.session.selection(), vec![first]);
+    assert_eq!(crate::a11y::focused_name(&u.ctx), "First");
+}
+
+#[test]
+fn grouped_drop_between_vertical_and_stacked_rows_keeps_the_visible_order() {
+    for source_vertical in [true, false] {
+        let mut s = Session::new();
+        let container = |s: &mut Session, x, vertical| {
+            let props = if vertical { json!({"layout": "vertical"}) } else { json!({}) };
+            id(s.execute("node.create", &json!({"type": "frame", "x": x, "width": 180, "height": 160, "props": props})).unwrap())
+        };
+        let source = container(&mut s, 0, source_vertical);
+        let target = container(&mut s, 240, !source_vertical);
+        let rect = |s: &mut Session, parent, name| {
+            id(s.execute("node.create", &json!({"type": "rectangle", "parent": parent, "width": 80, "height": 30, "name": name})).unwrap())
+        };
+        let (a, b) = if source_vertical {
+            (rect(&mut s, source, "A"), rect(&mut s, source, "B"))
+        } else {
+            let b = rect(&mut s, source, "B");
+            (rect(&mut s, source, "A"), b)
+        };
+        let c = rect(&mut s, target, "C");
+        s.execute("select.set", &json!({"ids": [b, a]})).unwrap();
+        let mut u = Ui::new(s);
+        u.app.ui.expanded.extend([source, target]);
+        let top = u.row_at(a);
+        assert!(top.y < u.row_at(b).y);
+        let above_c = u.row_at(c) - vec2(0.0, 4.0);
+        u.drag_to(top, above_c);
+        u.button(above_c, false);
+
+        let (a_row, b_row, c_row) = (u.row_at(a), u.row_at(b), u.row_at(c));
+        assert!(a_row.y < b_row.y && b_row.y < c_row.y, "A, B, C in the destination (source vertical: {source_vertical})");
+        let doc = u.app.session.doc().unwrap();
+        assert!(doc.node(source).unwrap().children.is_empty());
+        let want = if source_vertical { vec![c, b, a] } else { vec![a, b, c] };
+        assert_eq!(doc.node(target).unwrap().children, want);
+
+        u.app.run("edit.undo", json!({}));
+        let doc = u.app.session.doc().unwrap();
+        assert_eq!(doc.node(a).unwrap().parent, Some(source));
+        assert_eq!(doc.node(b).unwrap().parent, Some(source));
+        assert_eq!(doc.node(target).unwrap().children, vec![c]);
+    }
+}
+
+#[test]
+fn holding_over_a_collapsed_frame_opens_it_and_dropping_moves_the_layer_in() {
+    let (mut u, frame, child, rect) = setup();
+    let (r, f) = (u.row_at(rect), u.row_at(frame));
+    u.drag_to(r, f);
+    assert!(!u.app.ui.expanded.contains(&frame));
+    // Hold for a second over the middle of the frame's row.
+    for _ in 0..60 {
+        u.frame(vec![Event::PointerMoved(f)]);
+    }
+    assert!(u.app.ui.expanded.contains(&frame), "spring-loaded open");
+    u.button(f, false);
+    let doc = u.app.session.doc().unwrap();
+    assert_eq!(doc.node(rect).unwrap().parent, Some(frame), "dropped into the frame");
+    assert!(doc.node(frame).unwrap().children.contains(&child));
+}
+
+#[test]
+fn a_layer_cant_drop_into_its_own_child_and_escape_cancels() {
+    let (mut u, frame, child, rect) = setup();
+    u.app.ui.expanded.insert(frame);
+    u.frame(vec![]);
+    let (f, c) = (u.row_at(frame), u.row_at(child));
+    let parent_before = u.app.session.doc().unwrap().node(frame).unwrap().parent;
+    u.drag_to(f, c);
+    u.button(c, false);
+    assert_eq!(u.app.session.doc().unwrap().node(frame).unwrap().parent, parent_before, "not moved into itself");
+    assert!(u.app.ui.last_error.is_none(), "{:?}", u.app.ui.last_error);
+    // Escape during a drag: releasing over a target then does nothing.
+    let (r, f) = (u.row_at(rect), u.row_at(frame));
+    u.drag_to(r, f);
+    u.frame(vec![Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+    u.button(f, false);
+    assert_ne!(u.app.session.doc().unwrap().node(rect).unwrap().parent, Some(frame));
+}
+
+#[test]
+fn dropping_layers_on_another_page_moves_them_there() {
+    let (mut u, _frame, _child, rect) = setup();
+    let p1 = u.app.session.page().unwrap();
+    let p2 = id(u.app.session.execute("page.add", &json!({})).unwrap());
+    u.app.session.execute("page.select", &json!({"id": p1})).unwrap();
+    u.frame(vec![]);
+    // Find Page 2's row in the Pages list: the click that switches to it.
+    let mut at = None;
+    for y in (90..400).step_by(4) {
+        let p = Pos2::new(150.0, y as f32);
+        u.button(p, true);
+        u.button(p, false);
+        if u.app.session.page().unwrap() == p2 {
+            // Rows are 32 high: aim at the middle, past the hit tolerance at its edge.
+            at = Some(p + vec2(0.0, 12.0));
+            u.app.session.execute("page.select", &json!({"id": p1})).unwrap();
+            u.frame(vec![]);
+            break;
+        }
+    }
+    let page_row = at.expect("page 2 row");
+    let r = u.row_at(rect);
+    u.drag_to(r, page_row);
+    u.button(page_row, false);
+    let doc = u.app.session.doc().unwrap();
+    assert_eq!(doc.ancestors(rect).last().copied(), Some(p2), "moved to page 2");
+}
+
+#[test]
+fn dropping_a_layer_one_place_over_moves_it_one_place() {
+    // #992: the panel drops on a gap between rows; the layer ends up in that gap.
+    let mut s = Session::new();
+    let rect =
+        |s: &mut Session, x: i32| id(s.execute("node.create", &json!({"type": "rectangle", "x": x, "y": 0, "width": 10, "height": 10})).unwrap());
+    let (a, b, c) = (rect(&mut s, 0), rect(&mut s, 20), rect(&mut s, 40));
+    s.execute("select.none", &json!({})).unwrap();
+    let page = s.page().unwrap();
+    let mut u = Ui::new(s);
+    let kids = |u: &Ui| u.app.session.doc().unwrap().node(page).unwrap().children.clone();
+    // The list shows c, b, a top to bottom: `a` dragged onto the top edge of `b` goes just above it.
+    let (from, to) = (u.row_at(a), u.row_at(b) - vec2(0.0, 12.0));
+    u.drag_to(from, to);
+    u.button(to, false);
+    assert_eq!(kids(&u), [b, a, c], "dropped between b and c");
+    // And `c` dragged onto the bottom edge of `a` goes just below it.
+    let (from, to) = (u.row_at(c), u.row_at(a) + vec2(0.0, 12.0));
+    u.drag_to(from, to);
+    u.button(to, false);
+    assert_eq!(kids(&u), [b, c, a], "dropped between a and b");
+}
